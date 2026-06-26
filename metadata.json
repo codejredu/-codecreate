@@ -1,0 +1,6 @@
+{
+  "name": "Web Help System Builder",
+  "description": "A web-based documentation system that imports DOCX files and exports Markdown for GitHub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
