@@ -1,9 +1,11 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
-import { Upload, Download, Search, FileText, Menu, X, Github, ChevronRight, Palette, Type, Lock, Settings, LogOut } from 'lucide-react';
+import { Upload, Download, Search, FileText, Menu, X, Github, ChevronRight, Palette, Type, Lock, Settings, LogOut, Info } from 'lucide-react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import { processDocx, ThemeColor } from './utils/docx';
 import { DocData } from './types';
+import { saveToDB, getFromDB } from './utils/db';
+import { saveDocumentToFirebase, loadDocumentFromFirebase, base64ToArrayBuffer } from './utils/firebase';
 
 export type FontOption = 'font-heebo' | 'font-rubik' | 'font-alef';
 
@@ -27,44 +29,9 @@ const THEME_OPTIONS: { id: ThemeColor, label: string, colors: string[] }[] = [
   { id: 'yellowOrange', label: 'Yellow Orange', colors: ['bg-black', 'bg-white', 'bg-stone-700', 'bg-orange-200', 'bg-amber-500', 'bg-amber-600', 'bg-yellow-700', 'bg-orange-500', 'bg-orange-400', 'bg-orange-300'] },
 ];
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return window.btoa(binary);
-}
-
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const binaryString = window.atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
 export default function App() {
-  const [docData, setDocData] = useState<DocData | null>(() => {
-    try {
-      const saved = localStorage.getItem('docData');
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
-  });
-
-  const [fileBuffer, setFileBuffer] = useState<ArrayBuffer | null>(() => {
-    try {
-      const saved = localStorage.getItem('fileBuffer');
-      return saved ? base64ToArrayBuffer(saved) : null;
-    } catch {
-      return null;
-    }
-  });
+  const [docData, setDocData] = useState<DocData | null>(null);
+  const [fileBuffer, setFileBuffer] = useState<ArrayBuffer | null>(null);
 
   const [theme, setTheme] = useState<ThemeColor>(() => {
     return (localStorage.getItem('theme') as ThemeColor) || 'activePresenter';
@@ -76,6 +43,7 @@ export default function App() {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isSavingFirebase, setIsSavingFirebase] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
@@ -96,6 +64,100 @@ export default function App() {
     }
   };
 
+  const handleExitAdmin = async () => {
+    if (docData) {
+      setIsSavingFirebase(true);
+      setError(null);
+      try {
+        await saveDocumentToFirebase(docData, fileBuffer, theme, font);
+        console.log('Document successfully locked globally to Firebase');
+      } catch (err: any) {
+        console.error('Failed to lock document to Firebase:', err);
+        setError('שגיאה בשמירת המסמך לענן: ' + (err.message || err));
+      } finally {
+        setIsSavingFirebase(false);
+      }
+    }
+    setIsAdmin(false);
+  };
+
+  // Load document on initial mount
+  useEffect(() => {
+    const initializeDocument = async () => {
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+        // 1. Try loading from Firebase (Global source of truth)
+        const globalDoc = await loadDocumentFromFirebase();
+        if (globalDoc && globalDoc.docData) {
+          console.log('Successfully loaded global document from Firebase');
+          setDocData(globalDoc.docData);
+          if (globalDoc.fileBufferBase64) {
+            const buffer = base64ToArrayBuffer(globalDoc.fileBufferBase64);
+            setFileBuffer(buffer);
+            await saveToDB('fileBuffer', buffer);
+          }
+          if (globalDoc.theme) {
+            setTheme(globalDoc.theme as ThemeColor);
+            localStorage.setItem('theme', globalDoc.theme);
+          }
+          if (globalDoc.font) {
+            setFont(globalDoc.font as FontOption);
+            localStorage.setItem('font', globalDoc.font);
+          }
+          await saveToDB('docData', globalDoc.docData);
+          setIsLoading(false);
+          return;
+        }
+      } catch (err) {
+        console.warn('Failed to load global document from Firebase, trying local fallbacks:', err);
+      }
+      
+      // 2. Try to fetch default document.docx from public folder
+      try {
+        const response = await fetch('./document.docx');
+        if (response.ok) {
+          const arrayBuffer = await response.arrayBuffer();
+          if (arrayBuffer.byteLength > 4) {
+            const arr = new Uint8Array(arrayBuffer.slice(0, 4));
+            const isZip = arr[0] === 0x50 && arr[1] === 0x4B && arr[2] === 0x03 && arr[3] === 0x04;
+            if (isZip) {
+              const data = await processDocx(arrayBuffer.slice(0), theme);
+              setFileBuffer(arrayBuffer);
+              setDocData(data);
+              await saveToDB('fileBuffer', arrayBuffer);
+              await saveToDB('docData', data);
+              setIsLoading(false);
+              return;
+            } else {
+              console.log('Fetched document.docx but it is not a valid zip/docx file (likely an HTML fallback page).');
+            }
+          }
+        }
+      } catch (e) {
+        console.log('No default document.docx found, fallback to IndexedDB.', e);
+      }
+
+      // 3. Fallback to IndexedDB
+      try {
+        const savedBuffer = await getFromDB('fileBuffer');
+        const savedDocData = await getFromDB('docData');
+        if (savedBuffer && savedDocData) {
+          setFileBuffer(savedBuffer);
+          setDocData(savedDocData);
+        }
+      } catch (err) {
+        console.error('Failed to load from IndexedDB:', err);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    initializeDocument();
+  }, []);
+
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -105,13 +167,11 @@ export default function App() {
     try {
       const arrayBuffer = await file.arrayBuffer();
       
-      // Save original fileBuffer to localStorage as base64
+      // Save original fileBuffer to IndexedDB
       try {
-        const base64 = arrayBufferToBase64(arrayBuffer);
-        localStorage.setItem('fileBuffer', base64);
+        await saveToDB('fileBuffer', arrayBuffer);
       } catch (err) {
-        console.warn('Failed to save fileBuffer to localStorage:', err);
-        localStorage.removeItem('fileBuffer'); // Clear stale
+        console.warn('Failed to save fileBuffer to IndexedDB:', err);
       }
 
       setFileBuffer(arrayBuffer);
@@ -119,11 +179,11 @@ export default function App() {
       const data = await processDocx(arrayBuffer.slice(0), theme);
       setDocData(data);
       
-      // Save docData to localStorage
+      // Save docData to IndexedDB
       try {
-        localStorage.setItem('docData', JSON.stringify(data));
+        await saveToDB('docData', data);
       } catch (err) {
-        console.warn('Failed to save docData to localStorage:', err);
+        console.warn('Failed to save docData to IndexedDB:', err);
       }
 
       setSearchQuery('');
@@ -153,9 +213,9 @@ export default function App() {
           const data = await processDocx(fileBuffer.slice(0), theme);
           setDocData(data);
           try {
-            localStorage.setItem('docData', JSON.stringify(data));
+            await saveToDB('docData', data);
           } catch (e) {
-            console.warn('Failed to save docData to localStorage:', e);
+            console.warn('Failed to save docData to IndexedDB:', e);
           }
         } catch (err) {
           console.error('Failed to reprocess document with new theme:', err);
@@ -562,12 +622,35 @@ jobs:
               <>
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={isLoading}
+                  disabled={isLoading || isSavingFirebase}
                   className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:opacity-70 text-sm font-medium"
                 >
                   <Upload className="w-4 h-4" />
                   {isLoading ? 'מייבא...' : 'ייבא קובץ Word'}
                 </button>
+
+                {docData && (
+                  <button
+                    onClick={async () => {
+                      setIsSavingFirebase(true);
+                      setError(null);
+                      try {
+                        await saveDocumentToFirebase(docData, fileBuffer, theme, font);
+                        alert('המסמך נשמר וקובע במערכת בהצלחה עבור כל המשתמשים!');
+                      } catch (err: any) {
+                        alert('שגיאה בשמירה לענן: ' + (err.message || err));
+                      } finally {
+                        setIsSavingFirebase(false);
+                      }
+                    }}
+                    disabled={isSavingFirebase || isLoading}
+                    className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 transition-colors disabled:opacity-70 text-sm font-medium"
+                    title="שמור וקבע את המסמך בענן לכל המשתמשים"
+                  >
+                    <Settings className="w-4 h-4" />
+                    {isSavingFirebase ? 'שומר בענן...' : 'שמור וקבע במערכת'}
+                  </button>
+                )}
               </>
             )}
             
@@ -581,12 +664,13 @@ jobs:
               </button>
             ) : (
               <button
-                onClick={() => setIsAdmin(false)}
-                className="flex items-center justify-center gap-1.5 px-3 py-1 bg-green-100 text-green-800 hover:bg-green-200 text-xs font-bold rounded-full transition-colors"
-                title="יציאה מניהול"
+                onClick={handleExitAdmin}
+                disabled={isSavingFirebase}
+                className="flex items-center justify-center gap-1.5 px-3 py-1 bg-green-100 text-green-800 hover:bg-green-200 text-xs font-bold rounded-full transition-colors disabled:opacity-70"
+                title="יציאה מניהול ושמירה אוטומטית לענן"
               >
                 <LogOut className="w-3 h-3" />
-                מצב ניהול
+                {isSavingFirebase ? 'שומר ומקבע...' : 'מצב ניהול (יציאה ושמירה)'}
               </button>
             )}
           </div>
@@ -597,6 +681,15 @@ jobs:
           {error && (
             <div className="max-w-4xl mx-auto mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded relative" role="alert">
               <span className="block sm:inline">{error}</span>
+            </div>
+          )}
+
+          {isAdmin && (
+            <div className="max-w-4xl mx-auto mb-6 bg-blue-50/80 border border-blue-200 text-blue-900 px-4 py-3 rounded-lg flex items-start gap-3 shadow-sm" dir="rtl">
+              <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+              <div className="text-xs md:text-sm">
+                <span className="font-bold">טיפ מנהל:</span> כדי לקבע את המסמך לצמיתות עבור כל מי שנכנס לאתר ב-GitHub Pages, שמור את הקובץ בשם <code className="bg-blue-100 text-blue-800 px-1 py-0.5 rounded font-mono">document.docx</code> בתוך תיקיית <code className="bg-blue-100 text-blue-800 px-1 py-0.5 rounded font-mono">public</code> במאגר ה-GitHub שלך.
+              </div>
             </div>
           )}
 
