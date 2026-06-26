@@ -27,11 +27,53 @@ const THEME_OPTIONS: { id: ThemeColor, label: string, colors: string[] }[] = [
   { id: 'yellowOrange', label: 'Yellow Orange', colors: ['bg-black', 'bg-white', 'bg-stone-700', 'bg-orange-200', 'bg-amber-500', 'bg-amber-600', 'bg-yellow-700', 'bg-orange-500', 'bg-orange-400', 'bg-orange-300'] },
 ];
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
 export default function App() {
-  const [docData, setDocData] = useState<DocData | null>(null);
-  const [fileBuffer, setFileBuffer] = useState<ArrayBuffer | null>(null);
-  const [theme, setTheme] = useState<ThemeColor>('activePresenter');
-  const [font, setFont] = useState<FontOption>('font-heebo');
+  const [docData, setDocData] = useState<DocData | null>(() => {
+    try {
+      const saved = localStorage.getItem('docData');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [fileBuffer, setFileBuffer] = useState<ArrayBuffer | null>(() => {
+    try {
+      const saved = localStorage.getItem('fileBuffer');
+      return saved ? base64ToArrayBuffer(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [theme, setTheme] = useState<ThemeColor>(() => {
+    return (localStorage.getItem('theme') as ThemeColor) || 'activePresenter';
+  });
+
+  const [font, setFont] = useState<FontOption>(() => {
+    return (localStorage.getItem('font') as FontOption) || 'font-heebo';
+  });
+
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -62,9 +104,28 @@ export default function App() {
     setError(null);
     try {
       const arrayBuffer = await file.arrayBuffer();
+      
+      // Save original fileBuffer to localStorage as base64
+      try {
+        const base64 = arrayBufferToBase64(arrayBuffer);
+        localStorage.setItem('fileBuffer', base64);
+      } catch (err) {
+        console.warn('Failed to save fileBuffer to localStorage:', err);
+        localStorage.removeItem('fileBuffer'); // Clear stale
+      }
+
       setFileBuffer(arrayBuffer);
+
       const data = await processDocx(arrayBuffer.slice(0), theme);
       setDocData(data);
+      
+      // Save docData to localStorage
+      try {
+        localStorage.setItem('docData', JSON.stringify(data));
+      } catch (err) {
+        console.warn('Failed to save docData to localStorage:', err);
+      }
+
       setSearchQuery('');
     } catch (err: any) {
       setError(err.message || 'אירעה שגיאה בעיבוד הקובץ.');
@@ -73,21 +134,43 @@ export default function App() {
     }
   };
 
+  const prevTheme = useRef<ThemeColor>(theme);
+
   useEffect(() => {
+    // Save theme to localStorage
+    localStorage.setItem('theme', theme);
+
     if (!fileBuffer) return;
     
-    const reprocessDocument = async () => {
-      try {
-        // We must pass a copy of the buffer because mammoth might consume/modify it
-        const data = await processDocx(fileBuffer.slice(0), theme);
-        setDocData(data);
-      } catch (err) {
-        console.error('Failed to reprocess document with new theme:', err);
-      }
-    };
-    
-    reprocessDocument();
+    // Only reprocess if the theme actually changed from the previous value
+    if (prevTheme.current !== theme) {
+      prevTheme.current = theme;
+      
+      const reprocessDocument = async () => {
+        setIsLoading(true);
+        try {
+          // We must pass a copy of the buffer because mammoth might consume/modify it
+          const data = await processDocx(fileBuffer.slice(0), theme);
+          setDocData(data);
+          try {
+            localStorage.setItem('docData', JSON.stringify(data));
+          } catch (e) {
+            console.warn('Failed to save docData to localStorage:', e);
+          }
+        } catch (err) {
+          console.error('Failed to reprocess document with new theme:', err);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+      
+      reprocessDocument();
+    }
   }, [theme, fileBuffer]);
+
+  useEffect(() => {
+    localStorage.setItem('font', font);
+  }, [font]);
 
   const handleDownloadMarkdown = async () => {
     if (!docData) return;
